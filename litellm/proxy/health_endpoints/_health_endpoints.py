@@ -34,6 +34,14 @@ from litellm.proxy.health_check import (
 
 router = APIRouter()
 
+@router.get("/healthcheck", tags=["health"])
+async def health_check():
+    """
+    Simple health check endpoint that returns 200 OK.
+    Useful for container orchestration systems like Kubernetes.
+    """
+    return {"status": "ok"}
+
 
 @router.get(
     "/test",
