@@ -1915,6 +1915,24 @@ class ProxyConfig:
                     value=custom_sso, config_file_path=config_file_path
                 )
 
+            # Support for custom routes module
+            custom_routes_module = general_settings.get("custom_routes_module", None)
+            if custom_routes_module is not None:
+                custom_router = get_instance_fn(
+                    value=custom_routes_module, config_file_path=config_file_path
+                )
+                # Include the custom router in the app
+                if hasattr(custom_router, 'include_router'):
+                    # If it's an APIRouter, include it directly
+                    app.include_router(custom_router)
+                else:
+                    # If it's a module, look for a router attribute
+                    for attr_name in ['router', 'app_router', 'api_router', 'gocode_router']:
+                        if hasattr(custom_router, attr_name):
+                            router_instance = getattr(custom_router, attr_name)
+                            app.include_router(router_instance)
+                            break
+
             if enterprise_proxy_config is not None:
                 await enterprise_proxy_config.load_enterprise_config(general_settings)
 
