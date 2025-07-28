@@ -122,6 +122,7 @@ class ProviderSpecificModelInfo(TypedDict, total=False):
     supports_parallel_function_calling: Optional[bool]
     supports_web_search: Optional[bool]
     supports_reasoning: Optional[bool]
+    supports_url_context: Optional[bool]
 
 
 class SearchContextCostPerQuery(TypedDict, total=False):
@@ -176,7 +177,7 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
     search_context_cost_per_query: Optional[
         SearchContextCostPerQuery
     ]  # Cost for using web search tool
-
+    citation_cost_per_token: Optional[float]  # Cost per citation token for Perplexity
     litellm_provider: Required[str]
     mode: Required[
         Literal[
@@ -274,6 +275,15 @@ class CallTypes(Enum):
     retrieve_fine_tuning_job = "retrieve_fine_tuning_job"
     responses = "responses"
     aresponses = "aresponses"
+    alist_input_items = "alist_input_items"
+
+    #########################################################
+    # Google GenAI Native Call Types
+    #########################################################
+    generate_content = "generate_content"
+    agenerate_content = "agenerate_content"
+    generate_content_stream = "generate_content_stream"
+    agenerate_content_stream = "agenerate_content_stream"
 
 
 CallTypesLiteral = Literal[
@@ -302,6 +312,10 @@ CallTypesLiteral = Literal[
     "anthropic_messages",
     "aretrieve_batch",
     "retrieve_batch",
+    "generate_content",
+    "agenerate_content",
+    "generate_content_stream",
+    "agenerate_content_stream",
 ]
 
 
@@ -791,6 +805,13 @@ class Delta(OpenAIObject):
 
 
 class Choices(OpenAIObject):
+    finish_reason: str
+    index: int
+    message: Message
+    logprobs: Optional[Union[ChoiceLogprobs, Any]] = None
+
+    provider_specific_fields: Optional[Dict[str, Any]] = Field(default=None)
+
     def __init__(
         self,
         finish_reason=None,
@@ -798,30 +819,42 @@ class Choices(OpenAIObject):
         message: Optional[Union[Message, dict]] = None,
         logprobs: Optional[Union[ChoiceLogprobs, dict, Any]] = None,
         enhancements=None,
+        provider_specific_fields: Optional[Dict[str, Any]] = None,
         **params,
     ):
-        super(Choices, self).__init__(**params)
         if finish_reason is not None:
-            self.finish_reason = map_finish_reason(
-                finish_reason
-            )  # set finish_reason for all responses
+            params["finish_reason"] = map_finish_reason(finish_reason)
         else:
-            self.finish_reason = "stop"
-        self.index = index
+            params["finish_reason"] = "stop"
+        if index is not None:
+            params["index"] = index
+        else:
+            params["index"] = 0
         if message is None:
-            self.message = Message()
+            params["message"] = Message()
         else:
             if isinstance(message, Message):
-                self.message = message
+                params["message"] = message
             elif isinstance(message, dict):
-                self.message = Message(**message)
+                params["message"] = Message(**message)
         if logprobs is not None:
             if isinstance(logprobs, dict):
-                self.logprobs = ChoiceLogprobs(**logprobs)
+                params["logprobs"] = ChoiceLogprobs(**logprobs)
             else:
-                self.logprobs = logprobs
+                params["logprobs"] = logprobs
+        else:
+            params["logprobs"] = None
+        super(Choices, self).__init__(**params)
+
         if enhancements is not None:
             self.enhancements = enhancements
+
+        self.provider_specific_fields = provider_specific_fields
+
+        if self.logprobs is None:
+            del self.logprobs
+        if self.provider_specific_fields is None:
+            del self.provider_specific_fields
 
     def __contains__(self, key):
         # Define custom behavior for the 'in' operator
@@ -926,24 +959,6 @@ class Usage(CompletionUsage):
             elif isinstance(completion_tokens_details, CompletionTokensDetails):
                 _completion_tokens_details = completion_tokens_details
 
-        ## DEEPSEEK MAPPING ##
-        if "prompt_cache_hit_tokens" in params and isinstance(
-            params["prompt_cache_hit_tokens"], int
-        ):
-            if prompt_tokens_details is None:
-                prompt_tokens_details = PromptTokensDetailsWrapper(
-                    cached_tokens=params["prompt_cache_hit_tokens"]
-                )
-
-        ## ANTHROPIC MAPPING ##
-        if "cache_read_input_tokens" in params and isinstance(
-            params["cache_read_input_tokens"], int
-        ):
-            if prompt_tokens_details is None:
-                prompt_tokens_details = PromptTokensDetailsWrapper(
-                    cached_tokens=params["cache_read_input_tokens"]
-                )
-
         # handle prompt_tokens_details
         _prompt_tokens_details: Optional[PromptTokensDetailsWrapper] = None
         if prompt_tokens_details:
@@ -953,6 +968,28 @@ class Usage(CompletionUsage):
                 )
             elif isinstance(prompt_tokens_details, PromptTokensDetails):
                 _prompt_tokens_details = prompt_tokens_details
+
+        ## DEEPSEEK MAPPING ##
+        if "prompt_cache_hit_tokens" in params and isinstance(
+            params["prompt_cache_hit_tokens"], int
+        ):
+            if _prompt_tokens_details is None:
+                _prompt_tokens_details = PromptTokensDetailsWrapper(
+                    cached_tokens=params["prompt_cache_hit_tokens"]
+                )
+            else:
+                _prompt_tokens_details.cached_tokens = params["prompt_cache_hit_tokens"]
+
+        ## ANTHROPIC MAPPING ##
+        if "cache_read_input_tokens" in params and isinstance(
+            params["cache_read_input_tokens"], int
+        ):
+            if _prompt_tokens_details is None:
+                _prompt_tokens_details = PromptTokensDetailsWrapper(
+                    cached_tokens=params["cache_read_input_tokens"]
+                )
+            else:
+                _prompt_tokens_details.cached_tokens = params["cache_read_input_tokens"]
 
         super().__init__(
             prompt_tokens=prompt_tokens or 0,
@@ -1777,6 +1814,7 @@ class StandardLoggingUserAPIKeyMetadata(TypedDict):
     user_api_key_user_email: Optional[str]
     user_api_key_team_alias: Optional[str]
     user_api_key_end_user_id: Optional[str]
+    user_api_key_request_route: Optional[str]
 
 
 class StandardLoggingMCPToolCall(TypedDict, total=False):
@@ -2069,6 +2107,7 @@ all_litellm_params = [
     "mock_response",
     "mock_timeout",
     "disable_add_transform_inline_image_block",
+    "litellm_proxy_rate_limit_response",
     "api_key",
     "api_version",
     "prompt_id",
@@ -2130,6 +2169,7 @@ all_litellm_params = [
     "client_id",
     "azure_username",
     "azure_password",
+    "azure_scope",
     "client_secret",
     "user_continue_message",
     "configurable_clientside_auth_params",
@@ -2465,3 +2505,9 @@ class DynamicPromptManagementParamLiteral(str, Enum):
     @classmethod
     def list_all_params(cls):
         return [param.value for param in cls]
+
+
+class CallbacksByType(TypedDict):
+    success: List[str]
+    failure: List[str]
+    success_and_failure: List[str]
