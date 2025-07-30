@@ -78,7 +78,9 @@ from litellm.constants import (
 )
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
-from litellm.integrations.vector_stores.base_vector_store import BaseVectorStore
+from litellm.integrations.vector_store_integrations.base_vector_store import (
+    BaseVectorStore,
+)
 from litellm.litellm_core_utils.core_helpers import (
     map_finish_reason,
     process_response_headers,
@@ -127,6 +129,9 @@ from litellm.litellm_core_utils.redact_messages import (
 from litellm.litellm_core_utils.rules import Rules
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.litellm_core_utils.token_counter import get_modified_max_tokens
+from litellm.llms.base_llm.google_genai.transformation import (
+    BaseGoogleGenAIGenerateContentConfig,
+)
 from litellm.llms.bedrock.common_utils import BedrockModelInfo
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.router_utils.get_retry_from_policy import (
@@ -242,6 +247,7 @@ from litellm.llms.base_llm.image_variations.transformation import (
 from litellm.llms.base_llm.realtime.transformation import BaseRealtimeConfig
 from litellm.llms.base_llm.rerank.transformation import BaseRerankConfig
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
+from litellm.llms.base_llm.vector_store.transformation import BaseVectorStoreConfig
 
 from ._logging import _is_debugging_on, verbose_logger
 from .caching.caching import (
@@ -694,6 +700,7 @@ def function_setup(  # noqa: PLR0915
         if (
             call_type == CallTypes.completion.value
             or call_type == CallTypes.acompletion.value
+            or call_type == CallTypes.anthropic_messages.value
         ):
             messages = None
             if len(args) > 1:
@@ -765,7 +772,12 @@ def function_setup(  # noqa: PLR0915
             messages = args[0] if len(args) > 0 else kwargs["input"]
         else:
             messages = "default-message-value"
-        stream = True if "stream" in kwargs and kwargs["stream"] is True else False
+        stream = False
+        if _is_streaming_request(
+            kwargs=kwargs,
+            call_type=call_type,
+        ):
+            stream = True
         logging_obj = LiteLLMLogging(
             model=model,  # type: ignore
             messages=messages,
@@ -1018,7 +1030,10 @@ def client(original_function):  # noqa: PLR0915
 
             # MODEL CALL
             result = original_function(*args, **kwargs)
-            if "stream" in kwargs and kwargs["stream"] is True:
+            if _is_streaming_request(
+                kwargs=kwargs,
+                call_type=call_type,
+            ):
                 if (
                     "complete_response" in kwargs
                     and kwargs["complete_response"] is True
@@ -1162,7 +1177,10 @@ def client(original_function):  # noqa: PLR0915
             # MODEL CALL
             result = original_function(*args, **kwargs)
             end_time = datetime.datetime.now()
-            if "stream" in kwargs and kwargs["stream"] is True:
+            if _is_streaming_request(
+                kwargs=kwargs,
+                call_type=call_type,
+            ):
                 if (
                     "complete_response" in kwargs
                     and kwargs["complete_response"] is True
@@ -1354,7 +1372,10 @@ def client(original_function):  # noqa: PLR0915
             # MODEL CALL
             result = await original_function(*args, **kwargs)
             end_time = datetime.datetime.now()
-            if "stream" in kwargs and kwargs["stream"] is True:
+            if _is_streaming_request(
+                kwargs=kwargs,
+                call_type=call_type,
+            ):
                 if (
                     "complete_response" in kwargs
                     and kwargs["complete_response"] is True
@@ -1531,6 +1552,35 @@ def _is_async_request(
         or is_pass_through is True
     ):
         return True
+    return False
+
+
+def _is_streaming_request(
+    kwargs: Dict[str, Any],
+    call_type: Union[CallTypes, str],
+) -> bool:
+    """
+    Returns True if the call type is a streaming request.
+    Returns True if:
+        - if "stream=True" in kwargs  (litellm chat completion, litellm text completion, litellm messages)
+        - if call_type is generate_content_stream or agenerate_content_stream (litellm google genai)
+    """
+    if "stream" in kwargs and kwargs["stream"] is True:
+        return True
+
+    #########################################################
+    # Check if it's a google genai streaming request
+    if isinstance(call_type, str):
+        # check if it can be casted to CallTypes
+        try:
+            call_type = CallTypes(call_type)
+        except ValueError:
+            return False
+
+    if call_type == CallTypes.generate_content_stream or call_type == CallTypes.agenerate_content_stream:
+        return True
+    #########################################################
+    
     return False
 
 
@@ -1773,6 +1823,27 @@ def supports_web_search(model: str, custom_llm_provider: Optional[str] = None) -
         model=model,
         custom_llm_provider=custom_llm_provider,
         key="supports_web_search",
+    )
+
+
+def supports_url_context(model: str, custom_llm_provider: Optional[str] = None) -> bool:
+    """
+    Check if the given model supports URL context and return a boolean value.
+
+    Parameters:
+    model (str): The model name to be checked.
+    custom_llm_provider (str): The provider to be checked.
+
+    Returns:
+    bool: True if the model supports URL context, False otherwise.
+
+    Raises:
+    Exception: If the given model is not found in model_prices_and_context_window.json.
+    """
+    return _supports_factory(
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        key="supports_url_context",
     )
 
 
@@ -2056,6 +2127,43 @@ def supports_reasoning(model: str, custom_llm_provider: Optional[str] = None) ->
     )
 
 
+def get_supported_regions(
+    model: str, custom_llm_provider: Optional[str] = None
+) -> Optional[List[str]]:
+    """
+    Get a list of supported regions for a given model and provider.
+
+    Parameters:
+    model (str): The model name to be checked.
+    custom_llm_provider (Optional[str]): The provider to be checked.
+    """
+    try:
+        model, custom_llm_provider, _, _ = litellm.get_llm_provider(
+            model=model, custom_llm_provider=custom_llm_provider
+        )
+
+        model_info = _get_model_info_helper(
+            model=model, custom_llm_provider=custom_llm_provider
+        )
+
+        supported_regions = model_info.get("supported_regions", None)
+        if supported_regions is None:
+            return None
+
+        #########################################################
+        # Ensure only list supported regions are returned
+        #########################################################
+        if isinstance(supported_regions, list):
+            return supported_regions
+        else:
+            return None
+    except Exception as e:
+        verbose_logger.debug(
+            f"Model not found or error in checking supported_regions support. You passed model={model}, custom_llm_provider={custom_llm_provider}. Error: {str(e)}"
+        )
+        return None
+
+
 def supports_embedding_image_input(
     model: str, custom_llm_provider: Optional[str] = None
 ) -> bool:
@@ -2073,9 +2181,26 @@ def supports_embedding_image_input(
 def _update_dictionary(existing_dict: Dict, new_dict: dict) -> dict:
     for k, v in new_dict.items():
         if v is not None:
-            existing_dict[k] = v
+            # Convert stringified numbers to appropriate numeric types
+            existing_dict[k] = _convert_stringified_numbers(v)
 
     return existing_dict
+
+
+def _convert_stringified_numbers(value):
+    """Convert stringified numbers (including scientific notation) to appropriate numeric types."""
+    if isinstance(value, str):
+        try:
+            # Try to convert to float first to handle scientific notation like "3e-07"
+            if "e" in value.lower() or "." in value:
+                return float(value)
+            # Try to convert to int for whole numbers like "8192"
+            else:
+                return int(value)
+        except (ValueError, TypeError):
+            # If conversion fails, return the original string
+            return value
+    return value
 
 
 def register_model(model_cost: Union[str, dict]):  # noqa: PLR0915
@@ -2096,6 +2221,7 @@ def register_model(model_cost: Union[str, dict]):  # noqa: PLR0915
 
     loaded_model_cost = {}
     if isinstance(model_cost, dict):
+        # Convert stringified numbers to appropriate numeric types
         loaded_model_cost = model_cost
     elif isinstance(model_cost, str):
         loaded_model_cost = litellm.get_model_cost_map(url=model_cost)
@@ -4246,6 +4372,10 @@ def _check_provider_match(model_info: dict, custom_llm_provider: Optional[str]) 
             "litellm_provider"
         ].startswith("bedrock"):
             return True
+        elif (
+            custom_llm_provider == "litellm_proxy"
+        ):  # litellm_proxy is a special case, it's not a provider, it's a proxy for the provider
+            return True
         else:
             return False
 
@@ -4569,6 +4699,7 @@ def _get_model_info_helper(  # noqa: PLR0915
                 output_cost_per_second=_model_info.get("output_cost_per_second", None),
                 output_cost_per_image=_model_info.get("output_cost_per_image", None),
                 output_vector_size=_model_info.get("output_vector_size", None),
+                citation_cost_per_token=_model_info.get("citation_cost_per_token", None),
                 litellm_provider=_model_info.get(
                     "litellm_provider", custom_llm_provider
                 ),
@@ -4600,6 +4731,7 @@ def _get_model_info_helper(  # noqa: PLR0915
                     "supports_native_streaming", None
                 ),
                 supports_web_search=_model_info.get("supports_web_search", None),
+                supports_url_context=_model_info.get("supports_url_context", None),
                 supports_reasoning=_model_info.get("supports_reasoning", None),
                 supports_computer_use=_model_info.get("supports_computer_use", None),
                 search_context_cost_per_query=_model_info.get(
@@ -4674,6 +4806,7 @@ def get_model_info(model: str, custom_llm_provider: Optional[str] = None) -> Mod
             supports_audio_output: Optional[bool]
             supports_pdf_input: Optional[bool]
             supports_web_search: Optional[bool]
+            supports_url_context: Optional[bool]
             supports_reasoning: Optional[bool]
     Raises:
         Exception: If the model is not mapped yet.
@@ -6692,6 +6825,8 @@ class ProviderConfigManager:
             return litellm.InfinityRerankConfig()
         elif litellm.LlmProviders.JINA_AI == provider:
             return litellm.JinaAIRerankConfig()
+        elif litellm.LlmProviders.HUGGINGFACE == provider:
+            return litellm.HuggingFaceRerankConfig()
         return litellm.CohereRerankConfig()
 
     @staticmethod
@@ -6816,12 +6951,32 @@ class ProviderConfigManager:
     def get_provider_vector_store_config(
         provider: LlmProviders,
     ) -> Optional[CustomLogger]:
-        from litellm.integrations.vector_stores.bedrock_vector_store import (
+        from litellm.integrations.vector_store_integrations.bedrock_vector_store import (
             BedrockVectorStore,
         )
 
         if LlmProviders.BEDROCK == provider:
             return BedrockVectorStore.get_initialized_custom_logger()
+        return None
+    
+
+    @staticmethod
+    def get_provider_vector_stores_config(
+        provider: LlmProviders,
+    ) -> Optional[BaseVectorStoreConfig]:
+        """
+        v2 vector store config, use this for new vector store integrations
+        """
+        if litellm.LlmProviders.OPENAI == provider:
+            from litellm.llms.openai.vector_stores.transformation import (
+                OpenAIVectorStoreConfig,
+            )
+            return OpenAIVectorStoreConfig()
+        elif litellm.LlmProviders.AZURE == provider:
+            from litellm.llms.azure.vector_stores.transformation import (
+                AzureOpenAIVectorStoreConfig,
+            )
+            return AzureOpenAIVectorStoreConfig()
         return None
 
     @staticmethod
@@ -6871,6 +7026,25 @@ class ProviderConfigManager:
             )
 
             return AzureImageEditConfig()
+        return None
+    
+    @staticmethod
+    def get_provider_google_genai_generate_content_config(
+        model: str,
+        provider: LlmProviders,
+    ) -> Optional[BaseGoogleGenAIGenerateContentConfig]:
+        if litellm.LlmProviders.GEMINI == provider:
+            from litellm.llms.gemini.google_genai.transformation import (
+                GoogleGenAIConfig,
+            )
+
+            return GoogleGenAIConfig()
+        elif litellm.LlmProviders.VERTEX_AI == provider:
+            from litellm.llms.vertex_ai.google_genai.transformation import (
+                VertexAIGoogleGenAIConfig,
+            )
+
+            return VertexAIGoogleGenAIConfig()
         return None
 
 
@@ -7062,6 +7236,16 @@ def add_openai_metadata(metadata: dict) -> dict:
         for k, v in metadata.items()
         if k != "hidden_params" and isinstance(v, (str))
     }
+
+    # max 16 keys allowed by openai - trim down to 16
+    if len(visible_metadata) > 16:
+        filtered_metadata = {}
+        idx = 0
+        for k, v in visible_metadata.items():
+            if idx < 16:
+                filtered_metadata[k] = v
+            idx += 1
+        visible_metadata = filtered_metadata
 
     return visible_metadata.copy()
 
