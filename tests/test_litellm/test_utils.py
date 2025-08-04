@@ -11,12 +11,19 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 import litellm
-from litellm.types.utils import LlmProviders
+from litellm.types.utils import (
+    Delta,
+    LlmProviders,
+    ModelResponseStream,
+    StreamingChoices,
+)
 from litellm.utils import (
     ProviderConfigManager,
+    TextCompletionStreamWrapper,
     get_llm_provider,
     get_optional_params_image_gen,
 )
+from litellm.proxy.utils import is_valid_api_key
 
 # Adds the parent directory to the system path
 
@@ -36,6 +43,45 @@ def test_get_optional_params_image_gen():
     assert optional_params is not None
     assert "response_format" not in optional_params
     assert optional_params["n"] == 3
+
+
+def test_get_optional_params_image_gen_vertex_ai_size():
+    """Test that Vertex AI image generation properly handles size parameter and maps it to aspectRatio"""
+    # Test with various size parameters
+    test_cases = [
+        ("1024x1024", "1:1"),  # Square aspect ratio
+        ("256x256", "1:1"),  # Square aspect ratio
+        ("512x512", "1:1"),  # Square aspect ratio
+        ("1792x1024", "16:9"),  # Landscape aspect ratio
+        ("1024x1792", "9:16"),  # Portrait aspect ratio
+        ("unsupported", "1:1"),  # Default to square for unsupported sizes
+    ]
+
+    for size_input, expected_aspect_ratio in test_cases:
+        optional_params = get_optional_params_image_gen(
+            model="vertex_ai/imagegeneration@006",
+            size=size_input,
+            n=2,
+            custom_llm_provider="vertex_ai",
+            drop_params=True,
+        )
+        assert optional_params is not None
+        assert optional_params["aspectRatio"] == expected_aspect_ratio
+        assert optional_params["sampleCount"] == 2
+        assert "size" not in optional_params  # size should be converted to aspectRatio
+
+    # Test without size parameter
+    optional_params = get_optional_params_image_gen(
+        model="vertex_ai/imagegeneration@006",
+        n=1,
+        custom_llm_provider="vertex_ai",
+        drop_params=True,
+    )
+    assert optional_params is not None
+    assert (
+        "aspectRatio" not in optional_params
+    )  # aspectRatio should not be set if size is not provided
+    assert optional_params["sampleCount"] == 1
 
 
 def test_all_model_configs():
@@ -859,13 +905,6 @@ class TestProxyFunctionCalling:
                 "litellm_proxy/claude-3-5-sonnet-20240620",
                 True,
             ),
-            ("claude-3-opus-20240229", "litellm_proxy/claude-3-opus-20240229", True),
-            (
-                "claude-3-sonnet-20240229",
-                "litellm_proxy/claude-3-sonnet-20240229",
-                True,
-            ),
-            ("claude-3-haiku-20240307", "litellm_proxy/claude-3-haiku-20240307", True),
             # Google models
             ("gemini-pro", "litellm_proxy/gemini-pro", True),
             ("gemini/gemini-1.5-pro", "litellm_proxy/gemini/gemini-1.5-pro", True),
@@ -879,11 +918,6 @@ class TestProxyFunctionCalling:
             ),  # This model doesn't support function calling
             # Cohere models (generally don't support function calling)
             ("command-nightly", "litellm_proxy/command-nightly", False),
-            (
-                "anthropic.claude-instant-v1",
-                "litellm_proxy/anthropic.claude-instant-v1",
-                False,
-            ),
         ],
     )
     def test_proxy_function_calling_support_consistency(
@@ -1013,7 +1047,7 @@ class TestProxyFunctionCalling:
         ), "Custom model names return False without proxy config context"
 
         # Case 2: Model name that can be resolved (matches pattern)
-        resolvable_model = "litellm_proxy/claude-3-sonnet-20240229"
+        resolvable_model = "litellm_proxy/claude-3-5-sonnet-latest"
         result = supports_function_calling(resolvable_model)
         assert result is True, "Resolvable model names work with fallback logic"
 
@@ -1024,7 +1058,7 @@ class TestProxyFunctionCalling:
         
         ✅ WORKS (with current fallback logic):
            - litellm_proxy/gpt-4
-           - litellm_proxy/claude-3-sonnet-20240229
+           - litellm_proxy/claude-3-5-sonnet-latest
            - litellm_proxy/anthropic/claude-3-haiku-20240307
            
         ❌ DOESN'T WORK (requires proxy server config):
@@ -2011,8 +2045,6 @@ class TestProxyFunctionCalling:
                 print(f"Could not test {model}: {e}")
 
 
-
-
 def test_register_model_with_scientific_notation():
     """
     Test that the register_model function can handle scientific notation in the model name.
@@ -2035,6 +2067,122 @@ def test_register_model_with_scientific_notation():
     assert registered_model["output_cost_per_token"] == 6e-07
     assert registered_model["litellm_provider"] == "openai"
     assert registered_model["mode"] == "chat"
+
+
+def test_reasoning_content_preserved_in_text_completion_wrapper():
+    """Ensure reasoning_content is copied from delta to text_choices."""
+    chunk = ModelResponseStream(
+        id="test-id",
+        created=1234567890,
+        model="test-model",
+        object="chat.completion.chunk",
+        choices=[
+            StreamingChoices(
+                finish_reason=None,
+                index=0,
+                delta=Delta(
+                    content="Some answer text",
+                    role="assistant",
+                    reasoning_content="Here's my chain of thought...",
+                ),
+            )
+        ],
+    )
+
+    wrapper = TextCompletionStreamWrapper(
+        completion_stream=None,  # Not used in convert_to_text_completion_object
+        model="test-model",
+        stream_options=None,
+    )
+
+    transformed = wrapper.convert_to_text_completion_object(chunk)
+
+    assert "choices" in transformed
+    assert len(transformed["choices"]) == 1
+    choice = transformed["choices"][0]
+    assert choice["text"] == "Some answer text"
+    assert choice["reasoning_content"] == "Here's my chain of thought..."
+
+
+def test_anthropic_claude_4_invoke_chat_provider_config():
+    """Test that the Anthropic Claude 4 Invoke chat provider config is correct."""
+    from litellm.llms.bedrock.chat.invoke_transformations.anthropic_claude3_transformation import (
+        AmazonAnthropicClaude3Config,
+    )
+    from litellm.utils import ProviderConfigManager
+
+    config = ProviderConfigManager.get_provider_chat_config(
+        model="invoke/us.anthropic.claude-sonnet-4-20250514-v1:0",
+        provider=LlmProviders.BEDROCK,
+    )
+    print(config)
+    assert isinstance(config, AmazonAnthropicClaude3Config)
+
+
+def test_bedrock_application_inference_profile():
+    model = "arn:aws:bedrock:us-east-2:<AWS-ACCOUNT-ID>:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0"
+    from pydantic import BaseModel
+
+    from litellm import completion
+    from litellm.utils import supports_tool_choice
+
+    result = supports_tool_choice(model, custom_llm_provider="bedrock")
+    result_2 = supports_tool_choice(model, custom_llm_provider="bedrock_converse")
+    print(result)
+    assert result == result_2
+    assert result is True
+
+
+def test_image_response_utils():
+    """Test that the image response utils are correct."""
+    from litellm.utils import ImageResponse
+
+    result = {
+        "created": None,
+        "data": [
+            {
+                "b64_json": "/9j/.../2Q==",
+                "revised_prompt": None,
+                "url": None,
+                "timings": {"inference": 0.9612685777246952},
+                "index": 0,
+            }
+        ],
+        "id": "91559891cxxx-PDX",
+        "model": "black-forest-labs/FLUX.1-schnell-Free",
+        "object": "list",
+        "hidden_params": {"additional_headers": {}},
+    }
+    image_response = ImageResponse(**result)
+
+
+def test_is_valid_api_key():
+    import hashlib
+    # Valid sk- keys
+    assert is_valid_api_key("sk-abc123")
+    assert is_valid_api_key("sk-ABC_123-xyz")
+    # Valid hashed key (64 hex chars)
+    assert is_valid_api_key("a" * 64)
+    assert is_valid_api_key("0123456789abcdef" * 4)  # 16*4 = 64
+    # Real SHA-256 hash
+    real_hash = hashlib.sha256(b"my_secret_key").hexdigest()
+    assert len(real_hash) == 64
+    assert is_valid_api_key(real_hash)
+    # Invalid: too short
+    assert not is_valid_api_key("sk-")
+    assert not is_valid_api_key("")
+    # Invalid: too long
+    assert not is_valid_api_key("sk-" + "a" * 200)
+    # Invalid: wrong prefix
+    assert not is_valid_api_key("pk-abc123")
+    # Invalid: wrong chars in sk- key
+    assert not is_valid_api_key("sk-abc$%#@!")
+    # Invalid: not a string
+    assert not is_valid_api_key(None)
+    assert not is_valid_api_key(12345)
+    # Invalid: wrong length for hash
+    assert not is_valid_api_key("a" * 63)
+    assert not is_valid_api_key("a" * 65)
 
 
 if __name__ == "__main__":
