@@ -2019,7 +2019,6 @@ class ProxyConfig:
                     value=custom_sso, config_file_path=config_file_path
                 )
 
-<<<<<<< HEAD
             # Support for custom routes module
             custom_routes_module = general_settings.get("custom_routes_module", None)
             if custom_routes_module is not None:
@@ -2037,7 +2036,7 @@ class ProxyConfig:
                             router_instance = getattr(custom_router, attr_name)
                             app.include_router(router_instance)
                             break
-=======
+            
             custom_ui_sso_sign_in_handler = general_settings.get(
                 "custom_ui_sso_sign_in_handler", None
             )
@@ -2046,7 +2045,6 @@ class ProxyConfig:
                     value=custom_ui_sso_sign_in_handler,
                     config_file_path=config_file_path,
                 )
->>>>>>> origin
 
             if enterprise_proxy_config is not None:
                 await enterprise_proxy_config.load_enterprise_config(general_settings)
