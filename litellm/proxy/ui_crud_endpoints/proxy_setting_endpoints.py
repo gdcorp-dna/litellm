@@ -73,15 +73,15 @@ async def add_allowed_ip(ip_address: IPAddress):
         store_model_in_db,
     )
 
+    if prisma_client is None:
+        raise Exception("No DB Connected")
+
     _allowed_ips: List = general_settings.get("allowed_ips", [])
     if ip_address.ip not in _allowed_ips:
         _allowed_ips.append(ip_address.ip)
         general_settings["allowed_ips"] = _allowed_ips
     else:
         raise HTTPException(status_code=400, detail="IP address already exists")
-
-    if prisma_client is None:
-        raise Exception("No DB Connected")
 
     if store_model_in_db is not True:
         raise HTTPException(
@@ -244,6 +244,29 @@ async def get_default_team_settings():
     )
 
 
+async def update_default_team_member_budget(
+    teams: List[NewUserRequestTeam], user_api_key_dict: UserAPIKeyAuth
+):
+    """
+    1. Update the max member budget for the team
+    """
+    from fastapi import Request
+
+    from litellm.proxy.management_endpoints.team_endpoints import update_team
+
+    for team in teams:
+        team_id = team.team_id
+        max_budget_in_team = team.max_budget_in_team
+        await update_team(
+            data=UpdateTeamRequest(
+                team_id=team_id,
+                team_member_budget=max_budget_in_team,
+            ),
+            user_api_key_dict=user_api_key_dict,
+            http_request=Request(scope={"type": "http"}),
+        )
+
+
 async def _update_litellm_setting(
     settings: Union[DefaultInternalUserParams, DefaultTeamSSOParams],
     settings_key: str,
@@ -259,7 +282,15 @@ async def _update_litellm_setting(
         in_memory_var: The in-memory variable to update
         success_message: Message to return on success
     """
-    from litellm.proxy.proxy_server import proxy_config
+    from litellm.proxy.proxy_server import proxy_config, store_model_in_db
+
+    if store_model_in_db is not True:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Set `'STORE_MODEL_IN_DB='True'` in your env to enable this feature."
+            },
+        )
 
     # Update the in-memory settings
     in_memory_var = settings.model_dump(exclude_none=True)
@@ -288,11 +319,21 @@ async def _update_litellm_setting(
     tags=["SSO Settings"],
     dependencies=[Depends(user_api_key_auth)],
 )
-async def update_internal_user_settings(settings: DefaultInternalUserParams):
+async def update_internal_user_settings(
+    settings: DefaultInternalUserParams,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
     """
     Update the default internal user parameters for SSO users.
     These settings will be applied to new users who sign in via SSO.
     """
+    if settings.teams is not None and all(
+        isinstance(team, NewUserRequestTeam) for team in settings.teams
+    ):
+        await update_default_team_member_budget(
+            settings.teams, user_api_key_dict=user_api_key_dict  # type: ignore
+        )
+
     return await _update_litellm_setting(
         settings=settings,
         settings_key="default_internal_user_params",
@@ -360,6 +401,7 @@ async def get_sso_settings():
         generic_userinfo_endpoint=get_env_value("GENERIC_USERINFO_ENDPOINT"),
         proxy_base_url=get_env_value("PROXY_BASE_URL"),
         user_email=proxy_admin_email,  # Get from config instead of environment
+        ui_access_mode=general_settings.get("ui_access_mode", None),
     )
 
     # Get the schema for UI display
@@ -445,8 +487,14 @@ async def update_sso_settings(sso_config: SSOConfig):
             # Update in runtime environment
             os.environ[env_var_name] = value
 
+    stored_config = config
+    if len(config["environment_variables"]) > 0:
+
+        stored_config["environment_variables"] = proxy_config._encrypt_env_variables(
+            environment_variables=config["environment_variables"]
+        )
     # Save the updated config
-    await proxy_config.save_config(new_config=config)
+    await proxy_config.save_config(new_config=stored_config)
 
     return {
         "message": "SSO settings updated successfully",
